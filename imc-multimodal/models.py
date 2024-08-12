@@ -1,0 +1,144 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+from tsk import AntecedentGMF,TSK
+class ImageEncoder(nn.Module):#cnn image to vector
+    def __init__(self, args):
+        super(ImageEncoder, self).__init__()
+        self.args = args
+
+        model = torchvision.models.resnet18(pretrained=True)
+        modules = list(model.children())[:-1]
+        self.model = nn.Sequential(*modules)
+
+        pool_func = (
+            nn.AdaptiveAvgPool2d
+            if args.img_embed_pool_type == "avg"
+            else nn.AdaptiveMaxPool2d
+        )
+
+        if args.num_image_embeds in [1, 2, 3, 5, 7]:
+            self.pool = pool_func((args.num_image_embeds, 1))
+        elif args.num_image_embeds == 4:
+            self.pool = pool_func((2, 2))
+        elif args.num_image_embeds == 6:
+            self.pool = pool_func((3, 2))
+        elif args.num_image_embeds == 8:
+            self.pool = pool_func((4, 2))
+        elif args.num_image_embeds == 9:
+            self.pool = pool_func((3, 3))
+
+    def forward(self, x):
+        # Bx3x224x224 -> Bx2048x7x7 -> Bx2048xN -> BxNx2048
+        out = self.model(x)
+        out = self.pool(out)
+        out = torch.flatten(out, start_dim=2)
+        out = out.transpose(1, 2).contiguous()#512
+        return out  # BxNx2048
+# loss function
+def KL(alpha, c):
+    beta = torch.ones((1, c)).cuda()
+    S_alpha = torch.sum(alpha, dim=1, keepdim=True)
+    S_beta = torch.sum(beta, dim=1, keepdim=True)
+    lnB = torch.lgamma(S_alpha) - torch.sum(torch.lgamma(alpha), dim=1, keepdim=True)
+    lnB_uni = torch.sum(torch.lgamma(beta), dim=1, keepdim=True) - torch.lgamma(S_beta)
+    dg0 = torch.digamma(S_alpha)
+    dg1 = torch.digamma(alpha)
+    kl = torch.sum((alpha - beta) * (dg1 - dg0), dim=1, keepdim=True) + lnB + lnB_uni
+    return kl
+def sim_loss(alpha_rgb,alpha_depth,p):
+    loss =torch.mean( p*(alpha_rgb-alpha_depth)**2)
+    #loss =torch.mean( p*torch.abs(alpha_rgb-alpha_depth))
+    return loss
+
+def ce_loss(p, alpha, c, global_step, annealing_step):
+    S = torch.sum(alpha, dim=1, keepdim=True)
+    E = alpha - 1
+    label = F.one_hot(p, num_classes=c)
+    A = torch.sum(label * (torch.digamma(S) - torch.digamma(alpha)), dim=1, keepdim=True)
+
+    annealing_coef = min(1, global_step / annealing_step) # 1/20  21/20
+    alp = E * (1 - label) + 1
+    B = annealing_coef * KL(alp, c)
+    return torch.mean((A + B))
+
+
+class TMC(nn.Module):
+    def __init__(self, args):
+        super(TMC, self).__init__()
+        self.args = args
+        self.rgbenc = ImageEncoder(args)
+        self.depthenc = ImageEncoder(args)
+        depth_last_size = args.img_hidden_sz * args.num_image_embeds
+        rgb_last_size = args.img_hidden_sz * args.num_image_embeds
+        #self.clf_depth = nn.ModuleList()
+        #self.clf_rgb = nn.ModuleList()
+        #tsk model
+        self.clf_depth=nn.Sequential(AntecedentGMF(in_dim=depth_last_size, n_rule=args.n_rule, high_dim=True, init_center=None),
+                                     nn.LayerNorm(args.n_rule),
+                                    nn.ReLU())#args.n_rule_depth 
+       
+        self.clf_rgb = nn.Sequential(AntecedentGMF(in_dim=rgb_last_size, n_rule=args.n_rule, high_dim=True, init_center=None),
+                                    nn.LayerNorm(args.n_rule),
+                                    nn.ReLU())#args.n_rule_rgb
+        self.clf_depth_tsk=TSK(in_dim=depth_last_size, out_dim=args.n_classes, n_rule=args.n_rule, antecedent=self.clf_depth, order=args.order, precons=None)#precons cnn 
+        self.clf_rgb_tsk=TSK(in_dim=rgb_last_size, out_dim=args.n_classes, n_rule=args.n_rule, antecedent=self.clf_rgb, order=args.order, precons=None)
+        #initial papameters
+        
+
+
+
+    def DS_Combin_two(self, alpha1, alpha2):
+        # Calculate the merger of two DS evidences
+        alpha = dict()
+        alpha[0], alpha[1] = alpha1, alpha2
+        b, S, E, u = dict(), dict(), dict(), dict()
+        for v in range(2):
+            S[v] = torch.sum(alpha[v], dim=1, keepdim=True)
+            E[v] = alpha[v] - 1
+            b[v] = E[v] / (S[v].expand(E[v].shape))
+            u[v] = self.args.n_classes / S[v]
+
+        # b^0 @ b^(0+1)
+        bb = torch.bmm(b[0].view(-1, self.args.n_classes, 1), b[1].view(-1, 1, self.args.n_classes))
+        # b^0 * u^1
+        uv1_expand = u[1].expand(b[0].shape)
+        bu = torch.mul(b[0], uv1_expand)
+        # b^1 * u^0
+        uv_expand = u[0].expand(b[0].shape)
+        ub = torch.mul(b[1], uv_expand)
+        # calculate K
+        bb_sum = torch.sum(bb, dim=(1, 2), out=None)
+        bb_diag = torch.diagonal(bb, dim1=-2, dim2=-1).sum(-1)
+        # bb_diag1 = torch.diag(torch.mm(b[v], torch.transpose(b[v+1], 0, 1)))
+        K = bb_sum - bb_diag
+
+        # calculate b^a
+        b_a = (torch.mul(b[0], b[1]) + bu + ub) / ((1 - K).view(-1, 1).expand(b[0].shape))
+        # calculate u^a
+        u_a = torch.mul(u[0], u[1]) / ((1 - K).view(-1, 1).expand(u[0].shape))
+        # test = torch.sum(b_a, dim = 1, keepdim = True) + u_a #Verify programming errors
+
+        # calculate new S
+        S_a = self.args.n_classes / u_a
+        # calculate new e_k
+        e_a = torch.mul(b_a, S_a.expand(b_a.shape))
+        alpha_a = e_a + 1
+        return alpha_a
+
+    def forward(self, rgb, depth):
+        depth = self.depthenc(depth)
+        depth = torch.flatten(depth, start_dim=1)
+        rgb = self.rgbenc(rgb)
+        rgb = torch.flatten(rgb, start_dim=1)
+        depth_out = self.clf_depth_tsk(depth)
+        rgb_out = self.clf_rgb_tsk(rgb)
+
+
+        depth_evidence, rgb_evidence = F.softplus(depth_out), F.softplus(rgb_out)
+        depth_alpha, rgb_alpha = depth_evidence+1, rgb_evidence+1
+        depth_rgb_alpha = self.DS_Combin_two(depth_alpha, rgb_alpha)
+        return depth_alpha, rgb_alpha, depth_rgb_alpha,depth_out,rgb_out
+
+
